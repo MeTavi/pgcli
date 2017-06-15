@@ -62,6 +62,7 @@ from psycopg2 import OperationalError
 
 from collections import namedtuple
 
+
 # Query tuples are used for maintaining history
 MetaQuery = namedtuple(
     'Query',
@@ -83,6 +84,11 @@ OutputSettings = namedtuple(
 OutputSettings.__new__.__defaults__ = (
     None, None, None, '<null>', False, None, lambda x: x
 )
+
+
+class PasswordRequired(Exception):
+    # Raised when password prompt is required
+    pass
 
 
 # no-op logging handler
@@ -292,62 +298,13 @@ class PGCli(object):
         pgspecial_logger.addHandler(handler)
         pgspecial_logger.setLevel(log_level)
 
-    def connect_uri(self, uri):
-        uri = urlparse(uri)
-        database = uri.path[1:]  # ignore the leading fwd slash
-
-        def fixup_possible_percent_encoding(s):
-            return unquote(str(s)) if s else s
-
-        arguments = dict(database=fixup_possible_percent_encoding(database),
-                         host=fixup_possible_percent_encoding(uri.hostname),
-                         user=fixup_possible_percent_encoding(uri.username),
-                         port=fixup_possible_percent_encoding(uri.port),
-                         passwd=fixup_possible_percent_encoding(uri.password))
-        # Deal with extra params e.g. ?sslmode=verify-ca&ssl-cert=/mycert
-        if uri.query:
-            arguments = dict(
-                {k: v for k, (v,) in parse_qs(uri.query).items()},
-                **arguments)
-
-        # unquote str(each URI part (they may be percent encoded)
-        self.connect(**arguments)
-
-    def guess_socketdir(self):
-        candidates = [
-            '/var/run/postgresql',
-            '/var/pgsql_socket',
-            '/usr/local/var/postgres',
-            '/tmp',
-        ]
-
-        for candidate in candidates:
-            if os.path.isdir(candidate):
-                return candidate
-
-    def connect(self, database='', host='', user='', port='', passwd='',
-                dsn='', **kwargs):
-        # Connect to the database.
-        if not host:
-            host = self.guess_socketdir() or ''
-
-        if not user:
-            user = getuser()
-
-        if not database:
-            database = user
-
-        # If password prompt is not forced but no password is provided, try
-        # getting it from environment variable.
-        if not self.force_passwd_prompt and not passwd:
-            passwd = os.environ.get('PGPASSWORD', '')
-
+    def connect(self, database='', host='', user='', port='', passwd='', **kwargs):
         # Prompt for a password immediately if requested via the -W flag. This
         # avoids wasting time trying to connect to the database and catching a
         # no-password exception.
         # If we successfully parsed a password from a URI, there's no need to
         # prompt for it, even with the -W flag
-        if self.force_passwd_prompt and not passwd:
+        if self.force_passwd_prompt:
             passwd = click.prompt('Password', hide_input=True,
                                   show_default=False, type=str)
 
@@ -361,15 +318,15 @@ class PGCli(object):
         # a password (no -w flag), prompt for a passwd and try again.
         try:
             try:
-                pgexecute = PGExecute(database, user, passwd, host, port, dsn,
-                                      **kwargs)
+                pgexecute = PGExecute(
+                    database, user, passwd, host, port, **kwargs)
             except OperationalError as e:
                 if ('no password supplied' in utf8tounicode(e.args[0]) and
                         auto_passwd_prompt):
                     passwd = click.prompt('Password', hide_input=True,
                                           show_default=False, type=str)
-                    pgexecute = PGExecute(database, user, passwd, host, port,
-                                          dsn, **kwargs)
+                    pgexecute = PGExecute(
+                        database, user, passwd, host, port, **kwargs)
                 else:
                     raise e
 
@@ -775,6 +732,72 @@ class PGCli(object):
         return self.query_history[-1][0] if self.query_history else None
 
 
+def guess_socketdir():
+    candidates = [
+        '/var/run/postgresql',
+        '/var/pgsql_socket',
+        '/usr/local/var/postgres',
+        '/tmp',
+    ]
+
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+
+
+def fixup_possible_percent_encoding(s):
+    return unquote(str(s)) if s else s
+
+
+def parse_uri(uri):
+    uri = urlparse(uri)
+
+    user = fixup_possible_percent_encoding(uri.username)
+    passwd = fixup_possible_percent_encoding(uri.password)
+    host = fixup_possible_percent_encoding(uri.hostname)
+    port = fixup_possible_percent_encoding(uri.port)
+    # ignore the leading fwd slash
+    database = fixup_possible_percent_encoding(uri.path[1:])
+    # Deal with extra params e.g. ?sslmode=verify-ca&ssl-cert=/mycert
+    kw = dict()
+    if uri.query:
+        kw.update({
+            k: v
+            for k, (v,) in parse_qs(uri.query).items()
+        })
+
+    return dict(
+        user=user,
+        passwd=passwd,
+        host=host,
+        port=port,
+        database=database,
+        **kw
+    )
+
+
+def guess_connect_kwargs(user='', passwd='', host='', port=5432, database=''):
+    # Guess kwargs ot PGCli.connect method.
+    if not user:
+        user = getuser()
+
+    if not passwd:
+        passwd = os.environ.get('PGPASSWORD', '')
+
+    if not host:
+        host = guess_socketdir() or ''
+
+    if not database:
+        database = user
+
+    return dict(
+        user=user,
+        passwd=passwd,
+        host=host,
+        port=port,
+        database=database,
+    )
+
 
 @click.command()
 # Default host is '' so psycopg2 can default to either localhost or unix socket
@@ -834,28 +857,43 @@ def cli(database, username_opt, host, port, prompt_passwd, never_prompt,
                   row_limit=row_limit, single_connection=single_connection,
                   less_chatty=less_chatty, prompt=prompt)
 
-    # Choose which ever one has a valid value.
-    database = database or dbname
-    user = username_opt or username
+    cfg = load_config(pgclirc, config_full_path)
 
-    if dsn is not '':
+    # Check whether we got an URI to parse
+    uri = None
+    if dsn:
         try:
-            cfg = load_config(pgclirc, config_full_path)
-            dsn_config = cfg['alias_dsn'][dsn]
-        except:
+            uri = cfg['alias_dsn'][dsn]
+        except KeyError:
             click.secho('Invalid DSNs found in the config file. '\
                 'Please check the "[alias_dsn]" section in pgclirc.',
                  err=True, fg='red')
             exit(1)
-        pgcli.connect_uri(dsn_config)
-    elif '://' in database:
-        pgcli.connect_uri(database)
-    elif "=" in database:
-        pgcli.connect(dsn=database)
-    elif os.environ.get('PGSERVICE', None):
-        pgcli.connect(dsn='service={0}'.format(os.environ['PGSERVICE']))
     else:
-        pgcli.connect(database, host, user, port)
+        # Choose which ever one has a valid value.
+        database = database or dbname
+        user = username_opt or username
+
+        if '://' in database:
+            uri = database
+
+    # Reads connect kwargs either from URI or regular arguments/envvar
+    if uri:
+        connect_kwargs = parse_uri(uri)
+    else:
+        connect_kwargs = guess_connect_kwargs(
+            user=user,
+            host=host,
+            port=port,
+            database=database,
+        )
+
+    # Challenge before prompting password
+    try:
+        pgcli.connect(**connect_kwargs)
+    except PasswordRequired:
+        connect_kwargs['password'] = prompt_password()
+        pgcli.connect(**connect_kwargs)
 
     pgcli.logger.debug('Launch Params: \n'
             '\tdatabase: %r'

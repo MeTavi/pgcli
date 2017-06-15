@@ -146,7 +146,7 @@ class PGExecute(object):
         FROM pg_catalog.pg_database d
         ORDER BY 1'''
 
-    def __init__(self, database, user, password, host, port, dsn, **kwargs):
+    def __init__(self, database, user, password, host, port, dsn=None, **kwargs):
         self.dbname = database
         self.user = user
         self.password = password
