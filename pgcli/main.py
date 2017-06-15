@@ -857,13 +857,11 @@ def cli(database, username_opt, host, port, prompt_passwd, never_prompt,
                   row_limit=row_limit, single_connection=single_connection,
                   less_chatty=less_chatty, prompt=prompt)
 
-    cfg = load_config(pgclirc, config_full_path)
-
     # Check whether we got an URI to parse
     uri = None
     if dsn:
         try:
-            uri = cfg['alias_dsn'][dsn]
+            uri = pgcli.config['alias_dsn'][dsn]
         except KeyError:
             click.secho('Invalid DSNs found in the config file. '\
                 'Please check the "[alias_dsn]" section in pgclirc.',
